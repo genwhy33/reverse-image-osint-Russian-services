@@ -4,19 +4,22 @@ Multi-service reverse image search tool for OSINT investigations.
 
 ## Features
 
-- **Multiple search engines**: Yandex Images, Google Lens, Bing Visual Search, TinEye
-- **Metadata extraction**: EXIF data, GPS coordinates, camera info
-- **Face detection**: Optional face detection for identifying individuals
-- **Batch processing**: Process multiple images at once
-- **JSON/HTML reports**: Structured output for investigations
-- **Modular architecture**: Easy to add new search engines
+- **Multiple search engines**: Yandex Images, Google Lens, Bing Visual Search
+- **Metadata extraction**: EXIF data, GPS coordinates, camera info, MD5
+- **URL normalization**: filters weak search-engine pages, deduplicates results
+- **OSINT domain scoring**: VK/OK/Telegram/TikTok/Instagram ranked higher
+- **Batch processing**: process directory of images with threaded workers
+- **JSON reports**: structured output with combined results and top domains
+- **CLI**: simple one-image and batch modes
 
 ## Installation
 
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
-# Install Chrome/Chromium for web scraping
-# Install Tesseract for OCR if needed
+# Install Chrome/Chromium for Selenium
+# On Kali: sudo apt install chromium-driver chromium
 ```
 
 ## Quick Start
@@ -25,21 +28,27 @@ pip install -r requirements.txt
 # Single image search
 python src/osint_search.py /path/to/image.jpg
 
-# With metadata extraction
-python src/osint_search.py image.jpg --metadata
-
 # Batch processing
-python src/batch_search.py /path/to/images/ --output report.json
+python src/batch_search.py /path/to/images/ --workers 2 --max-results 15
 ```
 
-## Configuration
+## Output
 
-Copy `config/settings.example.json` to `config/settings.json` and add your API keys:
-
+Report JSON:
 ```json
 {
-  "tineye_api_key": "YOUR_TINEYE_KEY",
-  "bing_api_key": "YOUR_BING_KEY"
+  "image": "...",
+  "timestamp": "...",
+  "md5": "...",
+  "metadata": { "format": "JPEG", "width": 480, "height": 275, "exif": {...}, "gps": {...} },
+  "summary": { "yandex": {"status":"ok","count":10} },
+  "combined": {
+    "all_results": ["https://..."],
+    "top_domains": [
+      {"host":"vk.com","score":20,"url":"https://vk.com/..."},
+      {"host":"tgcnt.ru","score":18,"url":"https://tgcnt.ru/..."}
+    ]
+  }
 }
 ```
 
@@ -48,32 +57,14 @@ Copy `config/settings.example.json` to `config/settings.json` and add your API k
 | Service | Method | Notes |
 |---------|--------|-------|
 | Yandex Images | Selenium | Free, best for RU/EU |
-| Google Lens | Playwright | Free, good global coverage |
-| Bing Visual | API/Scrape | API key recommended |
-| TinEye | API | Free tier available |
-| EXIF/Metadata | ExifTool | Local, no API needed |
+| Google Lens | Selenium | Free, global coverage |
+| Bing Visual | Selenium | Free, useful supplement |
 
-## Architecture
+## Notes
 
-```
-src/
-├── osint_search.py      # Main entry point
-├── engines/             # Search engine modules
-│   ├── yandex.py
-│   ├── google.py
-│   ├── bing.py
-│   └── tineye.py
-├── analyzers/           # Image analysis
-│   ├── metadata.py
-│   └── faces.py
-└── reports/             # Report generation
-    ├── json_report.py
-    └── html_report.py
-```
-
-## Legal
-
-Use only for authorized investigations. Respect privacy laws and terms of service of search engines.
+- Requires Chrome/Chromium and matching chromedriver.
+- Google Lens may block some automated uploads; Yandex is currently the most reliable engine.
+- Use only for authorized investigations.
 
 ## License
 

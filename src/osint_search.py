@@ -9,10 +9,9 @@ import json
 import argparse
 import hashlib
 from datetime import datetime
-from urllib.parse import quote_plus
 
 from PIL import Image
-from PIL.ExifTags import TAGS, GPSTAGS
+from PIL.ExifTags import TAGS
 
 try:
     from exifread import process_file
@@ -27,54 +26,44 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
 from bs4 import BeautifulSoup
-from tqdm import tqdm
 from colorama import init, Fore, Style
 
+from analyzers import normalize_results, domain_summary
+
 init(autoreset=True)
+
+
+def get_image_resolution(path: str):
+    try:
+        with Image.open(path) as img:
+            return img.width, img.height
+    except Exception:
+        return None, None
 
 
 class ImageMetadata:
     @staticmethod
     def extract(image_path: str) -> dict:
         meta = {"file": image_path, "size": os.path.getsize(image_path)}
+        w, h = get_image_resolution(image_path)
+        meta.update({"width": w, "height": h, "aspect_ratio": round(w/h, 3) if h else None})
         try:
             with Image.open(image_path) as img:
-                meta["format"] = img.format
-                meta["mode"] = img.mode
-                meta["width"] = img.width
-                meta["height"] = img.height
-                meta["aspect_ratio"] = round(img.width / img.height, 3) if img.height else None
-        except Exception as e:
-            meta["error"] = str(e)
-            return meta
-
-        # EXIF via Pillow
-        try:
-            exif = img._getexif()
-            if exif:
-                tags = {}
-                for tag_id, value in exif.items():
-                    tag = TAGS.get(tag_id, tag_id)
-                    tags[str(tag)] = str(value)
-                meta["exif"] = tags
+                meta.update({"format": getattr(img, "format", None), "mode": getattr(img, "mode", None)})
+                exif = img._getexif()
+                if exif:
+                    meta["exif"] = {str(TAGS.get(t, t)): str(v) for t, v in exif.items()}
         except Exception:
             pass
-
-        # EXIF via exifread for detailed GPS/MakerNotes
         if HAS_EXIFREAD:
             try:
                 with open(image_path, "rb") as f:
                     tags = process_file(f, details=False)
-                    gps = {}
-                    for tag, value in tags.items():
-                        tag_name = tag.split(" ")[-1]
-                        if "GPS" in tag:
-                            gps[tag_name] = str(value)
+                    gps = {tag.split(" ")[-1]: str(v) for tag, v in tags.items() if "GPS" in tag}
                     if gps:
                         meta["gps"] = gps
             except Exception:
                 pass
-
         return meta
 
     @staticmethod
@@ -86,9 +75,7 @@ class ImageMetadata:
         return h.hexdigest()
 
 
-class YandexSearch:
-    NAME = "yandex"
-
+class BaseSearch:
     def __init__(self, headless=True):
         self.opts = Options()
         self.opts.add_argument("--headless=new")
@@ -98,194 +85,117 @@ class YandexSearch:
         self.opts.add_argument("--window-size=1280,900")
         self.opts.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36")
 
+    def _collect(self, driver, max_results=30):
+        raw = []
+        seen = set()
+        for link in driver.find_elements(By.CSS_SELECTOR, 'a[href*="http"]'):
+            href = link.get_attribute("href")
+            if href and href.startswith("http") and href not in seen:
+                seen.add(href)
+                raw.append(href)
+        return normalize_results(raw, max_results=max_results)
+
+    def _page_snapshot(self, driver):
+        try:
+            title = driver.title
+            soup = BeautifulSoup(driver.page_source, "html.parser")
+            snippets = [s.strip() for s in soup.stripped_strings if len(s.strip()) > 20][:20]
+        except Exception:
+            title, snippets = "", []
+        return title, snippets
+
+
+class YandexSearch(BaseSearch):
+    NAME = "yandex"
+
     def search(self, image_path: str, max_results=30) -> dict:
         driver = webdriver.Chrome(options=self.opts)
-        results = []
         errors = []
         try:
-            print(Fore.CYAN + f"[{self.NAME.upper()}] Opening Yandex Images...")
+            print(Fore.CYAN + f"[{self.NAME.upper()}] Open Yandex Images...")
             driver.get("https://yandex.com/images/")
             wait = WebDriverWait(driver, 20)
-
             try:
-                upload_btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, 'button.CbirUploadBtn, button[data-type="cbir"]')))
-                upload_btn.click()
+                wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, 'button.CbirUploadBtn, button[data-type="cbir"]'))).click()
             except Exception as e:
                 errors.append(f"upload_btn_click_failed: {e}")
                 print(Fore.YELLOW + f"[{self.NAME.upper()}] Upload btn failed: {e}")
-
             time.sleep(2)
             try:
-                file_input = driver.find_element(By.CSS_SELECTOR, 'input[type="file"]')
-                file_input.send_keys(os.path.abspath(image_path))
+                driver.find_element(By.CSS_SELECTOR, 'input[type="file"]').send_keys(os.path.abspath(image_path))
                 print(Fore.GREEN + f"[{self.NAME.upper()}] Image uploaded")
             except Exception as e:
                 errors.append(f"file_input_send_failed: {e}")
                 print(Fore.RED + f"[{self.NAME.upper()}] File input failed: {e}")
-
             time.sleep(10)
-
-            # Collect links
-            links = driver.find_elements(By.CSS_SELECTOR, 'a.Link, a[href*="http"]')
-            seen = set()
-            for link in links:
-                href = link.get_attribute("href")
-                if href and href.startswith("http") and href not in seen:
-                    seen.add(href)
-                    results.append(href)
-                    if len(results) >= max_results:
-                        break
-
-            # Collect page text for inspection
-            try:
-                title = driver.title
-                page_source = driver.page_source
-                soup = BeautifulSoup(page_source, "html.parser")
-                text_snippets = [s.strip() for s in soup.stripped_strings if len(s.strip()) > 20][:20]
-            except Exception:
-                title = ""
-                text_snippets = []
-
+            results = self._collect(driver, max_results=max_results)
+            title, text_snippets = self._page_snapshot(driver)
         except Exception as e:
             errors.append(f"fatal: {str(e)}")
             print(Fore.RED + f"[{self.NAME.upper()}] Fatal: {e}")
+            results = []
+            title, text_snippets = "", []
         finally:
             driver.quit()
-
-        return {
-            "engine": self.NAME,
-            "status": "ok" if results else "empty",
-            "results_count": len(results),
-            "results": results,
-            "title": title if 'title' in dir() else "",
-            "text_snippets": text_snippets if 'text_snippets' in dir() else [],
-            "errors": errors,
-        }
+        return {"engine": self.NAME, "status": "ok" if results else "empty", "results_count": len(results), "results": results, "title": title, "text_snippets": text_snippets, "errors": errors}
 
 
-class GoogleLensSearch:
+class GoogleLensSearch(BaseSearch):
     NAME = "google_lens"
 
-    def __init__(self, headless=True):
-        self.opts = Options()
-        self.opts.add_argument("--headless=new")
-        self.opts.add_argument("--no-sandbox")
-        self.opts.add_argument("--disable-dev-shm-usage")
-        self.opts.add_argument("--disable-gpu")
-        self.opts.add_argument("--window-size=1280,900")
-        self.opts.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36")
-
     def search(self, image_path: str, max_results=30) -> dict:
         driver = webdriver.Chrome(options=self.opts)
-        results = []
         errors = []
         try:
-            print(Fore.CYAN + f"[{self.NAME.upper()}] Opening Google Lens...")
+            print(Fore.CYAN + f"[{self.NAME.upper()}] Open Google Lens...")
             driver.get("https://lens.google.com/")
-            wait = WebDriverWait(driver, 20)
-
             time.sleep(3)
-            upload_xpath = "//input[@type='file']"
             try:
-                file_input = driver.find_element(By.XPATH, upload_xpath)
-                file_input.send_keys(os.path.abspath(image_path))
+                driver.find_element(By.XPATH, "//input[@type='file']").send_keys(os.path.abspath(image_path))
                 print(Fore.GREEN + f"[{self.NAME.upper()}] Image uploaded")
             except Exception as e:
                 errors.append(f"file_input_send_failed: {e}")
                 print(Fore.YELLOW + f"[{self.NAME.upper()}] File input failed: {e}")
-
             time.sleep(12)
-
-            links = driver.find_elements(By.CSS_SELECTOR, 'a[href*="http"]')
-            seen = set()
-            for link in links:
-                href = link.get_attribute("href")
-                if href and href.startswith("http") and href not in seen:
-                    seen.add(href)
-                    results.append(href)
-                    if len(results) >= max_results:
-                        break
-
-            title = driver.title
-            soup = BeautifulSoup(driver.page_source, "html.parser")
-            text_snippets = [s.strip() for s in soup.stripped_strings if len(s.strip()) > 20][:20]
+            results = self._collect(driver, max_results=max_results)
+            title, text_snippets = self._page_snapshot(driver)
         except Exception as e:
             errors.append(f"fatal: {str(e)}")
             print(Fore.RED + f"[{self.NAME.upper()}] Fatal: {e}")
+            results = []
+            title, text_snippets = "", []
         finally:
             driver.quit()
-
-        return {
-            "engine": self.NAME,
-            "status": "ok" if results else "empty",
-            "results_count": len(results),
-            "results": results,
-            "title": title if 'title' in dir() else "",
-            "text_snippets": text_snippets if 'text_snippets' in dir() else [],
-            "errors": errors,
-        }
+        return {"engine": self.NAME, "status": "ok" if results else "empty", "results_count": len(results), "results": results, "title": title, "text_snippets": text_snippets, "errors": errors}
 
 
-class BingVisualSearch:
+class BingVisualSearch(BaseSearch):
     NAME = "bing"
 
-    def __init__(self, headless=True):
-        self.opts = Options()
-        self.opts.add_argument("--headless=new")
-        self.opts.add_argument("--no-sandbox")
-        self.opts.add_argument("--disable-dev-shm-usage")
-        self.opts.add_argument("--disable-gpu")
-        self.opts.add_argument("--window-size=1280,900")
-        self.opts.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36")
-
     def search(self, image_path: str, max_results=30) -> dict:
         driver = webdriver.Chrome(options=self.opts)
-        results = []
         errors = []
         try:
-            print(Fore.CYAN + f"[{self.NAME.upper()}] Opening Bing Visual Search...")
+            print(Fore.CYAN + f"[{self.NAME.upper()}] Open Bing Visual Search...")
             driver.get("https://www.bing.com/visualsearch")
-            wait = WebDriverWait(driver, 20)
-
             time.sleep(3)
             try:
-                file_input = driver.find_element(By.CSS_SELECTOR, 'input[type="file"]')
-                file_input.send_keys(os.path.abspath(image_path))
+                driver.find_element(By.CSS_SELECTOR, 'input[type="file"]').send_keys(os.path.abspath(image_path))
                 print(Fore.GREEN + f"[{self.NAME.upper()}] Image uploaded")
             except Exception as e:
                 errors.append(f"file_input_send_failed: {e}")
                 print(Fore.YELLOW + f"[{self.NAME.upper()}] File input failed: {e}")
-
             time.sleep(12)
-
-            links = driver.find_elements(By.CSS_SELECTOR, 'a[href*="http"]')
-            seen = set()
-            for link in links:
-                href = link.get_attribute("href")
-                if href and href.startswith("http") and href not in seen:
-                    seen.add(href)
-                    results.append(href)
-                    if len(results) >= max_results:
-                        break
-
-            title = driver.title
-            soup = BeautifulSoup(driver.page_source, "html.parser")
-            text_snippets = [s.strip() for s in soup.stripped_strings if len(s.strip()) > 20][:20]
+            results = self._collect(driver, max_results=max_results)
+            title, text_snippets = self._page_snapshot(driver)
         except Exception as e:
             errors.append(f"fatal: {str(e)}")
             print(Fore.RED + f"[{self.NAME.upper()}] Fatal: {e}")
+            results = []
+            title, text_snippets = "", []
         finally:
             driver.quit()
-
-        return {
-            "engine": self.NAME,
-            "status": "ok" if results else "empty",
-            "results_count": len(results),
-            "results": results,
-            "title": title if 'title' in dir() else "",
-            "text_snippets": text_snippets if 'text_snippets' in dir() else [],
-            "errors": errors,
-        }
+        return {"engine": self.NAME, "status": "ok" if results else "empty", "results_count": len(results), "results": results, "title": title, "text_snippets": text_snippets, "errors": errors}
 
 
 def run_search(image_path: str, engines=None, max_results=30):
@@ -298,37 +208,33 @@ def run_search(image_path: str, engines=None, max_results=30):
         "md5": ImageMetadata.md5(image_path),
         "metadata": ImageMetadata.extract(image_path),
         "engines": [],
-        "summary": {}
+        "summary": {},
+        "combined": {"all_results": [], "top_domains": []},
     }
 
-    searchers = {
-        "yandex": YandexSearch,
-        "google_lens": GoogleLensSearch,
-        "bing": BingVisualSearch,
-    }
+    searchers = {"yandex": YandexSearch, "google_lens": GoogleLensSearch, "bing": BingVisualSearch}
 
     print(Fore.MAGENTA + Style.BRIGHT + f"\n=== Reverse Image OSINT ===")
     print(Fore.MAGENTA + f"Image: {image_path}")
     print(Fore.MAGENTA + f"MD5: {report['md5']}\n")
 
+    merged: list[str] = []
     for engine_name in engines:
         cls = searchers.get(engine_name)
         if not cls:
             print(Fore.YELLOW + f"[SKIP] Unknown engine: {engine_name}")
             continue
         try:
-            engine = cls()
-            res = engine.search(image_path, max_results=max_results)
+            res = cls().search(image_path, max_results=max_results)
             report["engines"].append(res)
-            report["summary"][engine_name] = {
-                "status": res.get("status"),
-                "count": res.get("results_count"),
-                "errors": res.get("errors"),
-            }
+            report["summary"][engine_name] = {"status": res.get("status"), "count": res.get("results_count"), "errors": res.get("errors")}
+            merged.extend(res.get("results", []))
         except Exception as e:
             print(Fore.RED + f"[{engine_name.upper()}] Exception: {e}")
             report["engines"].append({"engine": engine_name, "status": "error", "error": str(e)})
 
+    report["combined"]["all_results"] = list(dict.fromkeys(merged))
+    report["combined"]["top_domains"] = domain_summary(report["combined"]["all_results"])[:50]
     return report
 
 
@@ -353,7 +259,11 @@ def main():
 
     print(Fore.GREEN + Style.BRIGHT + f"\n[+] Report saved: {output_path}")
     print(Fore.GREEN + f"Engines run: {', '.join(args.engines)}")
+    print(Fore.GREEN + f"Unique results: {len(report['combined']['all_results'])}")
     print(json.dumps(report["summary"], indent=2, ensure_ascii=False))
+    print(Fore.YELLOW + "Top domains:")
+    for row in report["combined"]["top_domains"][:15]:
+        print(" ", row["score"], row["host"], "->", row["url"])
 
 
 if __name__ == "__main__":

@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+.env
+*.log
+
+# OSINT captures
+capture/
+*.pcap
+*.hc22000
+*.22000
+
+# Selenium
+geckodriver.log
+chromedriver.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
